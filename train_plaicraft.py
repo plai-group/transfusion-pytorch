@@ -1,0 +1,529 @@
+import sys
+# Add plaicraft-diffusion-model to path (handles editable install issues)
+sys.path.insert(0, '/ubc/cs/home/f/fwood/Projects/plaicraft/plaicraft-diffusion-model')
+
+import torch
+from torch.utils.data import DataLoader
+from pathlib import Path
+from functools import partial
+from transfusion_pytorch import Transfusion
+from transfusion_pytorch.transfusion import print_modality_sample, divisible_by
+import pprint
+
+# plaicraft-diffusion-model is installed with flat structure
+from data import PlaicraftMapDatasetFixed
+
+"""
+Plaicraft Transfusion Training Script
+
+Trains a Transfusion model on Plaicraft dataset with multiple modalities:
+- Audio (in/out): Flow-matched continuous modality
+- Video: 3 frames (2 history + 1 prediction), flow-matched
+- Keyboard/Mouse: Flow-matched continuous modality
+
+All modalities are jointly trained as conditional flow models (no text/autoregressive component).
+"""
+
+
+
+# Import Plaicraft dataloaders
+
+
+# Training configuration
+BATCH_SIZE = 1
+LEARNING_RATE = 1e-4
+NUM_TRAIN_STEPS = 100_000
+EVAL_EVERY = 1_000
+SAMPLE_EVERY = 5_000
+CHECKPOINT_EVERY = 10_000
+EMA_BETA = 0.9999
+
+# Model configuration
+DIM = 512
+DEPTH = 12
+HEADS = 8
+DIM_HEAD = 64
+
+# Modality configuration
+# 0: Audio In, 1: Audio Out, 2: Video, 3: Keyboard, 4: Mouse
+NUM_MODALITIES = 5
+AUDIO_DIM = 128  # Audio latent dimension
+VIDEO_DIM = 512  # Video latent dimension (per frame)
+KB_DIM = 32      # Keyboard embedding dimension
+MOUSE_DIM = 8    # Mouse state dimension (x, y, buttons, etc.)
+
+# ============ Configuration ============
+dataset_path = "/ubc/cs/research/ubc_ml/plaicraft/data/processed"  # Update this!
+global_database_path = "/ubc/cs/research/ubc_ml/plaicraft/data/versioning/global_databases/version_continuous_audio_hdf5/6.6k_6709_players_ids/global_database_training.db"  # Update this!
+player_names = ["Dante"]  # Or None to use all players
+
+# Dataset parameters
+modalities = ["video", "audio_in", "audio_out", "action"]  # Which modalities to load
+window_length_frames = 50  # Number of frames per sample
+
+# Training parameters
+batch_size = 4
+num_epochs = 5
+learning_rate = 1e-4
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# Custom collate function to convert Plaicraft batch to Transfusion format
+def transfusion_collate_fn(batch):
+    """
+    Convert Plaicraft batch format to Transfusion multi-modality format.
+    
+    Expected Plaicraft batch keys:
+    - 'audio_in': (B, C, T) or (B, T, C)
+    - 'audio_out': (B, C, T) or (B, T, C)
+    - 'video': (B, T=3, C, H, W)
+    - 'keyboard': (B, KB_DIM)
+    - 'mouse': (B, MOUSE_DIM)
+    
+    Transfusion format: List[List[Tuple[int, Tensor]]]
+    Each sample is a list of (modality_id, data) tuples.
+    """
+    # First use plaicraft collate if it exists
+    if callable(plaicraft_collate_fn):
+        batch = plaicraft_collate_fn(batch)
+    
+    # Now convert to Transfusion format
+    # the output from plaicraft_collate_fn is a dict with format like (here batch B=4, number of "frames"=25, each data frame has its own shape per modality - 
+    # key_press is 2x5x16, mouse_movement is 2x10x2, audio in is 15x128, audio_out is 15x128, video is 2x4x96x160)
+    # the fundamental "frame" is 2 units of each modality
+    # the following is an example of the shape of the output from plaicraft_collate with B=4, num_frames=25
+        # {'dict': {'action': {'dict': {'key_press': {'tensor': (4, 25, 2, 5, 16)},
+        #                             'mouse_movement': {'tensor': (4, 25, 2, 10, 2)}}},
+        #         'audio_in': {'tensor': (4, 25, 15, 128)},
+        #         'audio_out': {'tensor': (4, 25, 15, 128)},
+        #         'metadata': {'list': [{'list': [{'dict': {'end_frame': '36050',
+        #                                                     'player_email': "'c57fa94e436cf49a929d0168e47d26fec3d900b321775e280ef136979c01d5a4'",
+        #                                                     'player_gender': "'Male'",
+        #                                                     'player_id': '38',
+        #                                                     'player_name': "'Dante'",
+        #                                                     'player_skill_level': "'Regular'",
+        #                                                     'session_id': "'bf7fe22372485157'",
+        #                                                     'session_start_timestamp': '1722652425355',
+        #                                                     'start_frame': '36000',
+        #                                                     'window_length_frames': '50'}}]},
+        #                                 {'list': [{'dict': {'end_frame': '8450',
+        #                                                     'player_email': "'c57fa94e436cf49a929d0168e47d26fec3d900b321775e280ef136979c01d5a4'",
+        #                                                     'player_gender': "'Male'",
+        #                                                     'player_id': '38',
+        #                                                     'player_name': "'Dante'",
+        #                                                     'player_skill_level': "'Regular'",
+        #                                                     'session_id': "'4494f7aed47f3315'",
+        #                                                     'session_start_timestamp': '1725851918211',
+        #                                                     'start_frame': '8400',
+        #                                                     'window_length_frames': '50'}}]},
+        #                                 {'list': [{'dict': {'end_frame': '4800',
+        #                                                     'player_email': "'c57fa94e436cf49a929d0168e47d26fec3d900b321775e280ef136979c01d5a4'",
+        #                                                     'player_gender': "'Male'",
+        #                                                     'player_id': '38',
+        #                                                     'player_name': "'Dante'",
+        #                                                     'player_skill_level': "'Regular'",
+        #                                                     'session_id': "'10e3b2ff95d6ffcb'",
+        #                                                     'session_start_timestamp': '1738724872195',
+        #                                                     'start_frame': '4750',
+        #                                                     'window_length_frames': '50'}}]},
+        #                                 {'list': [{'dict': {'end_frame': '16900',
+        #                                                     'player_email': "'c57fa94e436cf49a929d0168e47d26fec3d900b321775e280ef136979c01d5a4'",
+        #                                                     'player_gender': "'Male'",
+        #                                                     'player_id': '38',
+        #                                                     'player_name': "'Dante'",
+        #                                                     'player_skill_level': "'Regular'",
+        #                                                     'session_id': "'06bb4a9d48db3b88'",
+        #                                                     'session_start_timestamp': '1732075203815',
+        #                                                     'start_frame': '16850',
+        #                                                     'window_length_frames': '50'}}]}]},
+        #         'transcript_in': {'list': [{'list': []},
+        #                                     {'list': [{'tuple': ["'I'",
+        #                                                         '844561',
+        #                                                         '844601']},
+        #                                             {'tuple': ['"don\'t"',
+        #                                                         '844621',
+        #                                                         '844741']},
+        #                                             {'tuple': ["'have'",
+        #                                                         '844761',
+        #                                                         '844841']},
+        #                                             {'tuple': ["'any'",
+        #                                                         '844861',
+        #                                                         '844961']}]},
+        #                                     {'list': []},
+        #                                     {'list': []}]},
+        #         'transcript_out': {'list': [{'list': []},
+        #                                     {'list': [{'tuple': ["'iron.'",
+        #                                                         '840324',
+        #                                                         '840645']},
+        #                                                 {'tuple': ["'Take'",
+        #                                                         '841085',
+        #                                                         '841305']},
+        #                                                 {'tuple': ["'some,'",
+        #                                                         '841365',
+        #                                                         '841646']},
+        #                                                 {'tuple': ["'like,'",
+        #                                                         '841726',
+        #                                                         '842026']},
+        #                                                 {'tuple': ["'carrots,'",
+        #                                                         '842787',
+        #                                                         '843347']},
+        #                                                 {'tuple': ["'I'",
+        #                                                         '843447',
+        #                                                         '843507']},
+        #                                                 {'tuple': ["'guess.'",
+        #                                                         '843547',
+        #                                                         '843907']}]},
+        #                                     {'list': []},
+        #                                     {'list': []}]},
+        #         'valid_mask': {'tensor': (4, 25, 2, 1)},
+        #         'video': {'tensor': (4, 25, 2, 4, 96, 160)}}}
+        # the goal is to convert this into a datastructure compatible with Transfusion where each sample (for Transfusion) 
+        # is one "frame" of audio_out, one "frame" of video, then one "frame" of keyboard, one "frame" of mouse, one "frame" of audio_in
+        # in transfusion speak i believe this should result in each sample having modalities like
+        #     modality_default_shape=(
+        #     (15,128),          # Audio In: 100 time steps
+        #     (15,128),          # Audio Out: 100 time steps
+        #     (2, 4, 96, 160),     # Video: 2 frames of four channel at 96x160
+        #     (2, 5, 16),              # Keyboard: scalar embedding
+        #     (2, 10, 2)               # Mouse: scalar state
+        # ),
+        # modality_num_dim=(2, 2, 4, 3, 3),  # Dimensionality of each modality
+        # with then each sample in transfusion being structured as a list of (modality_id, data) tuples like:
+        # [
+        #   (0, audio_out_frame_0),  # modality 0: audio_out
+        #   (1, video_frame_0),      # modality 1: video
+        #   (2, keyboard_frame_0),   # modality 2: keyboard
+        #   (3, mouse_frame_0),      # modality 3: mouse
+        #   (4, audio_in_frame_0),   # modality 4: audio_in
+        #   (5, audio_out_frame_1),  # modality 0: audio_out
+        #   (6, video_frame_1),      # modality 1: video
+        #   (7, keyboard_frame_1),   # modality 2: keyboard
+        #   (8, mouse_frame_1),      # modality 3: mouse
+        #   (9, audio_in_frame_1),   # modality 4: audio_in
+        #   
+        # ]
+        # note that the video is really a 4 channel 96 x 160 image and should have appropriate positional embeddings applied in transfusion (handled by transfusion itself
+        # and that audio is just a 15 x 128 tensor per frame (no positional embeddings needed).  relative time (to each other) positional embeddings should be used for the continuous modalities (audio, keyboard, mouse)
+
+        # ---------------------------------------------------------------------------------
+        # Expected input (after Plaicraft's own collate):
+        #   batch: Dict with keys
+        #     - 'audio_in':  Tensor[B, T, 15, 128]
+        #     - 'audio_out': Tensor[B, T, 15, 128]
+        #     - 'video':     Tensor[B, T, 2, 4, 96, 160]
+        #     - 'action':    {
+        #           'key_press':      Tensor[B, T, 2, 5, 16],
+        #           'mouse_movement': Tensor[B, T, 2, 10, 2]
+        #       }
+        #     - 'valid_mask': Tensor[B, T, 2, 1]  (optional use to filter invalid pairs)
+        #
+        # Goal output (Transfusion format):
+        #   List over batch of sequences; each sequence is a List[Tuple[int, Tensor]]
+        #   For each time index t in [0..T-1], we append the modalities in this order:
+        #     0: audio_out frame (shape [15, 128])
+        #     1: video      pair (shape [2, 4, 96, 160])
+        #     2: keyboard   pair (shape [2, 5, 16])
+        #     3: mouse      pair (shape [2, 10, 2])
+        #     4: audio_in   frame (shape [15, 128])
+        #
+        # Notes
+        # - We treat the "fundamental frame" as a pair for modalities that are naturally paired
+        #   in the dataset (video/key_press/mouse_movement -> leading dimension of 2) and as a
+        #   single frame for audio modalities (audio_in/out -> no leading pair dimension).
+        # - We keep raw shapes so the Transfusion model can apply axial positional embeddings
+        #   for 2D/3D modalities and relative time embeddings for 1D/paired modalities.
+        # - If 'valid_mask' is present and both elements in the pair are invalid for a time
+        #   index, we skip appending that time step entirely to avoid training on invalid data.
+        # ---------------------------------------------------------------------------------
+
+        # Basic validations and shape extraction
+        assert isinstance(batch, dict), "Expected a dict from Plaicraft collate_fn"
+
+        audio_in = batch.get('audio_in')
+        audio_out = batch.get('audio_out')
+        video = batch.get('video')
+        action = batch.get('action', {})
+        key_press = None if action is None else action.get('key_press')
+        mouse = None if action is None else action.get('mouse_movement')
+        valid_mask = batch.get('valid_mask', None)
+
+        # Ensure required keys are present
+        required = {
+            'audio_in': audio_in,
+            'audio_out': audio_out,
+            'video': video,
+        }
+        missing = [k for k, v in required.items() if v is None]
+        assert not missing, f"Missing required modalities from collate: {missing}"
+
+        B = audio_in.shape[0]
+        T = audio_in.shape[1]
+
+        # Consistency checks across modalities on B and T
+        def _check_bt(tensor, name):
+            assert tensor.shape[0] == B and tensor.shape[1] == T, \
+                f"{name} must share batch/time dims with audio_in: got {tuple(tensor.shape[:2])} vs {(B, T)}"
+
+        _check_bt(audio_out, 'audio_out')
+        _check_bt(video, 'video')
+        if key_press is not None:
+            _check_bt(key_press, 'action.key_press')
+        if mouse is not None:
+            _check_bt(mouse, 'action.mouse_movement')
+        if valid_mask is not None:
+            _check_bt(valid_mask, 'valid_mask')
+
+        # Build Transfusion batch: list over samples
+        transfusion_batch = []
+
+        for b in range(B):
+            sample_seq = []  # sequence for this sample (list of (modality_id, tensor))
+
+            for t in range(T):
+                # # If a valid_mask is present and both elements of the pair are invalid, skip
+                # if valid_mask is not None:
+                #     # valid_mask[b, t] -> shape [2, 1]; consider time step valid if any element is 1
+                #     vm = valid_mask[b, t]
+                #     # Convert to boolean and reduce
+                #     if torch.is_floating_point(vm):
+                #         vm_bool = vm > 0.5
+                #     else:
+                #         vm_bool = vm != 0
+                #     pair_is_valid = bool(vm_bool.any().item())
+                #     if not pair_is_valid:
+                #         continue
+
+                # Extract per-time tensors; keep original shapes
+                aout_bt = audio_out[b, t]            # [15, 128]
+                vid_bt = video[b, t]                 # [2, 4, 96, 160]
+                ain_bt = audio_in[b, t]              # [15, 128]
+
+                # Optional action modalities (if present in dataset config)
+                if key_press is not None:
+                    kbd_bt = key_press[b, t]         # [2, 5, 16]
+                else:
+                    kbd_bt = None
+
+                if mouse is not None:
+                    mouse_bt = mouse[b, t]           # [2, 10, 2]
+                else:
+                    mouse_bt = None
+
+                # Ensure tensors are float32 for continuous modalities
+                aout_bt = aout_bt.float().contiguous()
+                vid_bt = vid_bt.float().contiguous()
+                ain_bt = ain_bt.float().contiguous()
+                if kbd_bt is not None:
+                    kbd_bt = kbd_bt.float().contiguous()
+                if mouse_bt is not None:
+                    mouse_bt = mouse_bt.float().contiguous()
+
+                # Append in the intended order per time step
+                # Modality ID mapping:
+                #   0: audio_out, 1: video, 2: keyboard, 3: mouse, 4: audio_in
+                sample_seq.append((0, aout_bt))
+                sample_seq.append((1, vid_bt))
+                if kbd_bt is not None:
+                    sample_seq.append((2, kbd_bt))
+                if mouse_bt is not None:
+                    sample_seq.append((3, mouse_bt))
+                sample_seq.append((4, ain_bt))
+
+            transfusion_batch.append(sample_seq)
+
+        return transfusion_batch
+
+print(f"Using device: {device}")
+
+# ============ Initialize Dataset ============
+print("Initializing dataset...")
+dataset = PlaicraftMapDatasetFixed(
+    dataset_path=dataset_path,
+    modalities=modalities,
+    window_length_frames=window_length_frames,
+    hop_length_frames=window_length_frames,  # No overlap
+    player_names=player_names,
+    global_database_path=global_database_path
+)
+
+plaicraft_collate_fn=dataset.collate_fn
+
+
+print(f"Dataset initialized with {len(dataset)} samples")
+
+sample = dataset[0]
+print("Sample keys:", sample.keys())
+
+f=lambda x: {'tensor':tuple(x.shape)} if hasattr(x,'shape') else \
+           {'list':[f(i) for i in x]} if isinstance(x,list) else \
+           {'tuple':[f(i) for i in x]} if isinstance(x,tuple) else \
+           {'dict':{k:f(v) for k,v in x.items()}} if isinstance(x,dict) else \
+           repr(x); 
+
+
+pprint.pprint(f(sample))
+
+# THIS IS THE SHAPE OF A SINGLE SAMPLE FROM THE PLAICRAFT DATASET
+# {'dict': {'action': {'dict': {'key_press': {'tensor': (16, 250)},
+#                               'mouse_movement': {'tensor': (2, 500)}}},
+#           'audio_in': {'tensor': (128, 375)},
+#           'audio_out': {'tensor': (128, 375)},
+#           'metadata': {'list': [{'dict': {'end_frame': '50',
+#                                           'player_email': "'c57fa94e436cf49a929d0168e47d26fec3d900b321775e280ef136979c01d5a4'",
+#                                           'player_gender': "'Male'",
+#                                           'player_id': '38',
+#                                           'player_name': "'Dante'",
+#                                           'player_skill_level': "'Regular'",
+#                                           'session_id': "'e292ae30b0ac475f'",
+#                                           'session_start_timestamp': '1722075844615',
+#                                           'start_frame': '0',
+#                                           'window_length_frames': '50'}}]},
+#           'transcript_in': {'list': []},
+#           'transcript_out': {'list': []},
+#           'valid_mask': {'tensor': (50, 1)},
+#           'video': {'tensor': (50, 4, 96, 160)}}}
+
+
+
+# ============ Create DataLoader ============
+dataloader = DataLoader(
+    dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=2,
+    collate_fn=transfusion_collate_fn,
+    pin_memory=True if device.type == "cuda" else False
+)
+
+# draw a single batch to test
+batch = next(iter(dataloader))
+print(f"Batch size: {len(batch)}")
+for i, sample in enumerate(batch):
+    print(f" Sample {i}:")
+    pprint.pprint(f(sample))    
+
+# Create Transfusion model with multiple modalities
+print('Initializing Transfusion model...')
+model = Transfusion(
+    num_text_tokens=0,  # No text modality
+    dim=DIM,
+    depth=DEPTH,
+    heads=HEADS,
+    dim_head=DIM_HEAD,
+    
+    # Multiple modality configurations
+    # Modality 0: Audio In (1D temporal)
+    # Modality 1: Audio Out (1D temporal)
+    # Modality 2: Video (2D spatial per frame, 3 frames)
+    # Modality 3: Keyboard (0D embedding)
+    # Modality 4: Mouse (0D state vector)
+    dim_latent=(AUDIO_DIM, AUDIO_DIM, VIDEO_DIM, KB_DIM, MOUSE_DIM),
+    modality_default_shape=(
+        (100,),          # Audio In: 100 time steps
+        (100,),          # Audio Out: 100 time steps
+        (3, 64, 64),     # Video: 3 frames of 64x64
+        (),              # Keyboard: scalar embedding
+        ()               # Mouse: scalar state
+    ),
+    modality_num_dim=(1, 1, 2, 0, 0),  # Dimensionality of each modality
+    
+    # Training settings
+    ignore_index=-1,
+    add_pos_emb=True,  # Positional embeddings for spatial/temporal modalities
+    channel_first_latent=True,  # Video is (C, H, W)
+    
+    # Use flex attention if available for efficiency
+    use_flex_attn=torch.cuda.is_available(),
+    
+    # Flow matching settings
+    odeint_kwargs=dict(
+        method='midpoint',
+        atol=1e-5,
+        rtol=1e-5
+    )
+).to(device)
+
+print(f'Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M')
+
+# Create EMA model for stable inference
+ema_model = model.create_ema(beta=EMA_BETA)
+
+# Optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
+
+# Create dataloader
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=4,
+    collate_fn=transfusion_collate_fn,
+    pin_memory=True
+)
+
+# Training loop
+print('Starting training...')
+step = 0
+model.train()
+
+while step < NUM_TRAIN_STEPS:
+    for batch in train_loader:
+        if step >= NUM_TRAIN_STEPS:
+            break
+        
+        # Forward pass
+        loss_breakdown = model(batch)
+        loss = loss_breakdown.total
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        # Update EMA
+        ema_model.update()
+        
+        # Logging
+        if divisible_by(step, 100):
+            print(f'Step {step}/{NUM_TRAIN_STEPS} | Loss: {loss.item():.4f} | Flow: {loss_breakdown.flow:.4f}')
+        
+        # Evaluation
+        if divisible_by(step, EVAL_EVERY):
+            model.eval()
+            with torch.no_grad():
+                # Sample from EMA model
+                print('\n--- Sampling from EMA model ---')
+                sample = ema_model.sample(
+                    batch_size=1,
+                    max_length=512,  # Adjust based on expected total sequence length
+                    temperature=1.0
+                )
+                print_modality_sample(sample)
+            model.train()
+        
+        # Save checkpoint
+        if divisible_by(step, CHECKPOINT_EVERY):
+            checkpoint = {
+                'step': step,
+                'model_state_dict': model.state_dict(),
+                'ema_model_state_dict': ema_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }
+            torch.save(checkpoint, CHECKPOINT_PATH / f'checkpoint_step_{step}.pt')
+            print(f'Saved checkpoint at step {step}')
+        
+        step += 1
+
+print('Training complete!')
+
+# Save final model
+final_checkpoint = {
+    'step': step,
+    'model_state_dict': model.state_dict(),
+    'ema_model_state_dict': ema_model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+}
+torch.save(final_checkpoint, CHECKPOINT_PATH / 'final_model.pt')
+print(f'Saved final model to {CHECKPOINT_PATH / "final_model.pt"}')
