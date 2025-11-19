@@ -2,6 +2,7 @@ import sys
 # Add plaicraft-diffusion-model to path (handles editable install issues)
 sys.path.insert(0, '/ubc/cs/home/f/fwood/Projects/plaicraft/plaicraft-diffusion-model')
 
+import os
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
@@ -37,6 +38,8 @@ EVAL_EVERY = 1_000
 SAMPLE_EVERY = 5_000
 CHECKPOINT_EVERY = 10_000
 EMA_BETA = 0.9999
+CHECKPOINT_PATH = Path('results/plaicraft_checkpoints')
+CHECKPOINT_PATH.mkdir(parents=True, exist_ok=True)
 
 # Model configuration
 DIM = 512
@@ -59,7 +62,7 @@ player_names = ["Dante"]  # Or None to use all players
 
 # Dataset parameters
 modalities = ["video", "audio_in", "audio_out", "action"]  # Which modalities to load
-window_length_frames = 50  # Number of frames per sample
+window_length_frames = 8 # Number of frames per sample
 
 # Training parameters
 batch_size = 4
@@ -67,6 +70,11 @@ num_epochs = 5
 learning_rate = 1e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+f=lambda x: {'tensor':tuple(x.shape)} if hasattr(x,'shape') else \
+           {'list':[f(i) for i in x]} if isinstance(x,list) else \
+           {'tuple':[f(i) for i in x]} if isinstance(x,tuple) else \
+           {'dict':{k:f(v) for k,v in x.items()}} if isinstance(x,dict) else \
+           repr(x); 
 
 # Custom collate function to convert Plaicraft batch to Transfusion format
 def transfusion_collate_fn(batch):
@@ -276,62 +284,41 @@ def transfusion_collate_fn(batch):
         # Build Transfusion batch: list over samples
         transfusion_batch = []
 
+
+        # Causal ordering: input modalities at time t condition output modalities at time t+1
+        # Order per timestep: keyboard_{t}, mouse_{t}, audio_in_{t} -> audio_out_{t+1}, video_{t+1}
+        # This ensures that actions/audio_in at time t predict the resulting audio_out and video at t+1
+        # We iterate from t=0 to T-2 (using t and t+1 pairs)
         for b in range(B):
             sample_seq = []  # sequence for this sample (list of (modality_id, tensor))
+            
+            # Add dummy token to avoid empty text list error (will be ignored with ignore_index=-1)
+            #sample_seq.extend(torch.tensor([-1], dtype=torch.long, device=audio_in.device))
 
-            for t in range(T):
-                # # If a valid_mask is present and both elements of the pair are invalid, skip
-                # if valid_mask is not None:
-                #     # valid_mask[b, t] -> shape [2, 1]; consider time step valid if any element is 1
-                #     vm = valid_mask[b, t]
-                #     # Convert to boolean and reduce
-                #     if torch.is_floating_point(vm):
-                #         vm_bool = vm > 0.5
-                #     else:
-                #         vm_bool = vm != 0
-                #     pair_is_valid = bool(vm_bool.any().item())
-                #     if not pair_is_valid:
-                #         continue
+            for t in range(1, T - 1):  # Stop at T since we access t+1
+                sample_seq.append((3, key_press[b, t-1, 0].float()))   
+                sample_seq.append((4, mouse[b, t-1, 0].float())) 
+                sample_seq.append((2, video[b, t-1, 0].float())) 
+                sample_seq.append((3, key_press[b, t-1, 1].float()))   
+                sample_seq.append((4, mouse[b, t-1, 1].float())) 
+                sample_seq.append((2, video[b, t-1, 1].float()))
+                sample_seq.append((0, audio_in[b, t-1].float()))
+                sample_seq.append((1, audio_out[b, t-1].float()))
+                sample_seq.append((0, audio_in[b, t].float()))
+                sample_seq.append((4, mouse[b, t, 0].float()))
+                sample_seq.append((3, key_press[b, t, 0].float()))
+                sample_seq.append((4, mouse[b, t, 1].float()))
+                sample_seq.append((3, key_press[b, t, 1].float()))
+                sample_seq.append((2, video[b, t, 0].float())) 
+                sample_seq.append((2, video[b, t, 1].float())) 
+                sample_seq.append((1, audio_out[b, t].float()))
 
-                # Extract per-time tensors; keep original shapes
-                aout_bt = audio_out[b, t]            # [15, 128]
-                vid_bt = video[b, t]                 # [2, 4, 96, 160]
-                ain_bt = audio_in[b, t]              # [15, 128]
-
-                # Optional action modalities (if present in dataset config)
-                if key_press is not None:
-                    kbd_bt = key_press[b, t]         # [2, 5, 16]
-                else:
-                    kbd_bt = None
-
-                if mouse is not None:
-                    mouse_bt = mouse[b, t]           # [2, 10, 2]
-                else:
-                    mouse_bt = None
-
-                # Ensure tensors are float32 for continuous modalities
-                aout_bt = aout_bt.float().contiguous()
-                vid_bt = vid_bt.float().contiguous()
-                ain_bt = ain_bt.float().contiguous()
-                if kbd_bt is not None:
-                    kbd_bt = kbd_bt.float().contiguous()
-                if mouse_bt is not None:
-                    mouse_bt = mouse_bt.float().contiguous()
-
-                # Append in the intended order per time step
-                # Modality ID mapping:
-                #   0: audio_out, 1: video, 2: keyboard, 3: mouse, 4: audio_in
-                sample_seq.append((0, aout_bt))
-                sample_seq.append((1, vid_bt))
-                if kbd_bt is not None:
-                    sample_seq.append((2, kbd_bt))
-                if mouse_bt is not None:
-                    sample_seq.append((3, mouse_bt))
-                sample_seq.append((4, ain_bt))
 
             transfusion_batch.append(sample_seq)
-
+        print("INSIDE TRANSFUSION COLLATE FN OUTPUT:")
+        pprint.pprint(f(transfusion_batch))
         return transfusion_batch
+
 
 print(f"Using device: {device}")
 
@@ -354,43 +341,17 @@ print(f"Dataset initialized with {len(dataset)} samples")
 sample = dataset[0]
 print("Sample keys:", sample.keys())
 
-f=lambda x: {'tensor':tuple(x.shape)} if hasattr(x,'shape') else \
-           {'list':[f(i) for i in x]} if isinstance(x,list) else \
-           {'tuple':[f(i) for i in x]} if isinstance(x,tuple) else \
-           {'dict':{k:f(v) for k,v in x.items()}} if isinstance(x,dict) else \
-           repr(x); 
+
 
 
 pprint.pprint(f(sample))
-
-# THIS IS THE SHAPE OF A SINGLE SAMPLE FROM THE PLAICRAFT DATASET
-# {'dict': {'action': {'dict': {'key_press': {'tensor': (16, 250)},
-#                               'mouse_movement': {'tensor': (2, 500)}}},
-#           'audio_in': {'tensor': (128, 375)},
-#           'audio_out': {'tensor': (128, 375)},
-#           'metadata': {'list': [{'dict': {'end_frame': '50',
-#                                           'player_email': "'c57fa94e436cf49a929d0168e47d26fec3d900b321775e280ef136979c01d5a4'",
-#                                           'player_gender': "'Male'",
-#                                           'player_id': '38',
-#                                           'player_name': "'Dante'",
-#                                           'player_skill_level': "'Regular'",
-#                                           'session_id': "'e292ae30b0ac475f'",
-#                                           'session_start_timestamp': '1722075844615',
-#                                           'start_frame': '0',
-#                                           'window_length_frames': '50'}}]},
-#           'transcript_in': {'list': []},
-#           'transcript_out': {'list': []},
-#           'valid_mask': {'tensor': (50, 1)},
-#           'video': {'tensor': (50, 4, 96, 160)}}}
-
-
 
 # ============ Create DataLoader ============
 dataloader = DataLoader(
     dataset,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=2,
+    num_workers=0,
     collate_fn=transfusion_collate_fn,
     pin_memory=True if device.type == "cuda" else False
 )
@@ -398,42 +359,85 @@ dataloader = DataLoader(
 # draw a single batch to test
 batch = next(iter(dataloader))
 print(f"Batch size: {len(batch)}")
+print(f"Type of batch: {type(batch)}")
+print(f"Type of batch[0]: {type(batch[0])}")
+print(f"Type of batch[0][0]: {type(batch[0][0])}")
+print(f"batch[0][0] = {batch[0][0]}")
 for i, sample in enumerate(batch):
     print(f" Sample {i}:")
     pprint.pprint(f(sample))    
+
+
+    # def __init__(
+    #     self,
+    #     *,
+    #     num_text_tokens,
+    #     transformer: dict | Transformer,
+    #     dim_latent: int | tuple[int, ...] | None = None,
+    #     channel_first_latent: bool | tuple[bool, ...] = False,
+    #     add_pos_emb: bool | tuple[bool, ...] = False,
+    #     modality_encoder: Module | tuple[Module, ...] | None = None,
+    #     modality_decoder: Module | tuple[Module, ...] | None = None,
+    #     pre_post_transformer_enc_dec: tuple[Module, Module] | tuple[tuple[Module, Module], ...] | None = None,
+    #     modality_default_shape: tuple[int, ...] | tuple[tuple[int, ...], ...] | None = None,
+    #     fallback_to_default_shape_if_invalid = False,
+    #     modality_num_dim: int | tuple[int, ...] | None = None,
+    #     to_modality_shape_fn: Callable | tuple[Callable, ...] = default_to_modality_shape_fn,
+    #     ignore_index = -1,
+    #     flow_loss_weight = 1.,
+    #     text_loss_weight = 1.,
+    #     velocity_consistency_loss_weight = 0.1,
+    #     reconstruction_loss_weight = 0.,
+    #     modality_encoder_decoder_requires_batch_dim = True, # whether the modality encoder / decoder requires batch dimension, will auto assume it is needed
+    #     odeint_kwargs: dict = dict(
+    #         atol = 1e-5,
+    #         rtol = 1e-5,
+    #         method = 'midpoint'
+    #     ),
+    # ):
 
 # Create Transfusion model with multiple modalities
 print('Initializing Transfusion model...')
 model = Transfusion(
     num_text_tokens=0,  # No text modality
-    dim=DIM,
-    depth=DEPTH,
-    heads=HEADS,
-    dim_head=DIM_HEAD,
-    
-    # Multiple modality configurations
-    # Modality 0: Audio In (1D temporal)
-    # Modality 1: Audio Out (1D temporal)
-    # Modality 2: Video (2D spatial per frame, 3 frames)
-    # Modality 3: Keyboard (0D embedding)
-    # Modality 4: Mouse (0D state vector)
-    dim_latent=(AUDIO_DIM, AUDIO_DIM, VIDEO_DIM, KB_DIM, MOUSE_DIM),
-    modality_default_shape=(
-        (100,),          # Audio In: 100 time steps
-        (100,),          # Audio Out: 100 time steps
-        (3, 64, 64),     # Video: 3 frames of 64x64
-        (),              # Keyboard: scalar embedding
-        ()               # Mouse: scalar state
+    transformer = dict(
+        dim = DIM,
+        depth = DEPTH,
+        dim_head = DIM_HEAD,
+        heads = HEADS,
     ),
-    modality_num_dim=(1, 1, 2, 0, 0),  # Dimensionality of each modality
+    
+    # Modality configurations matching collate output:
+    # Modality 0: audio_in   - shape [15, 128] - 1D temporal signal
+    # Modality 1: audio_out  - shape [15, 128] - 1D temporal signal  
+    # Modality 2: video      - shape [4, 96, 160] - 2D spatial (C, H, W)
+    # Modality 3: key_press  - shape [5, 16] - 2D embedding (keys, features)
+    # Modality 4: mouse      - shape [10, 2] - 2D trajectory (steps, xy)
+    dim_latent=(128, 128, 4, 16, 2),
+    
+    modality_default_shape=(
+        (15, 128),      # audio_in: 15 time steps × 128 features
+        (15, 128),      # audio_out: 15 time steps × 128 features
+        (4, 96, 160),   # video: 4 channels × 96 height × 160 width
+        (5, 16),        # keyboard: 5 keys × 16 embedding dims
+        (10, 2),        # mouse: 10 time steps × 2 coords (x,y)
+    ),
+    
+    modality_num_dim=(2, 2, 3, 2, 2),  # Number of spatial/temporal dimensions per modality
+    
+    # channel_first_latent: whether input is (C, ...) vs (..., C)
+    # - audio: (15, 128) is (time, features) → channel-last → False
+    # - video: (4, 96, 160) is (C, H, W) → channel-first → True  
+    # - keyboard/mouse: (keys, features) / (time, xy) → channel-last → False
+    channel_first_latent=(False, False, True, False, False),
+    
+    # add_pos_emb: inject learned positional embeddings
+    # - audio: temporal position embeddings helpful
+    # - video: spatial (H, W) axial embeddings
+    add_pos_emb=(True, True, True, False, False),
     
     # Training settings
     ignore_index=-1,
-    add_pos_emb=True,  # Positional embeddings for spatial/temporal modalities
-    channel_first_latent=True,  # Video is (C, H, W)
-    
-    # Use flex attention if available for efficiency
-    use_flex_attn=torch.cuda.is_available(),
     
     # Flow matching settings
     odeint_kwargs=dict(
@@ -453,14 +457,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
 
 # Create dataloader
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=4,
-    collate_fn=transfusion_collate_fn,
-    pin_memory=True
-)
+train_loader = dataloader
 
 # Training loop
 print('Starting training...')
@@ -473,6 +470,7 @@ while step < NUM_TRAIN_STEPS:
             break
         
         # Forward pass
+        # fixme: batch is empty here
         loss_breakdown = model(batch)
         loss = loss_breakdown.total
         
