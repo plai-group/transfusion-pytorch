@@ -42,18 +42,10 @@ CHECKPOINT_PATH = Path('results/plaicraft_checkpoints')
 CHECKPOINT_PATH.mkdir(parents=True, exist_ok=True)
 
 # Model configuration
-DIM = 512
-DEPTH = 12
-HEADS = 8
-DIM_HEAD = 64
-
-# Modality configuration
-# 0: Audio In, 1: Audio Out, 2: Video, 3: Keyboard, 4: Mouse
-NUM_MODALITIES = 5
-AUDIO_DIM = 128  # Audio latent dimension
-VIDEO_DIM = 512  # Video latent dimension (per frame)
-KB_DIM = 32      # Keyboard embedding dimension
-MOUSE_DIM = 8    # Mouse state dimension (x, y, buttons, etc.)
+DIM = 128
+DEPTH = 2
+HEADS = 2
+DIM_HEAD = 32
 
 # ============ Configuration ============
 dataset_path = "/ubc/cs/research/ubc_ml/plaicraft/data/processed"  # Update this!
@@ -61,11 +53,11 @@ global_database_path = "/ubc/cs/research/ubc_ml/plaicraft/data/versioning/global
 player_names = ["Dante"]  # Or None to use all players
 
 # Dataset parameters
-modalities = ["video", "audio_in", "audio_out", "action"]  # Which modalities to load
-window_length_frames = 8 # Number of frames per sample
+modalities = ["video", "audio_speak", "audio_hear", "KeyAndMouse"]  # Which modalities to load
+window_length_frames = 6 # Number of frames per sample
 
 # Training parameters
-batch_size = 4
+batch_size = 1
 num_epochs = 5
 learning_rate = 1e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -82,8 +74,8 @@ def transfusion_collate_fn(batch):
     Convert Plaicraft batch format to Transfusion multi-modality format.
     
     Expected Plaicraft batch keys:
-    - 'audio_in': (B, C, T) or (B, T, C)
-    - 'audio_out': (B, C, T) or (B, T, C)
+    - 'audio_speak': (B, C, T) or (B, T, C)
+    - 'audio_hear': (B, C, T) or (B, T, C)
     - 'video': (B, T=3, C, H, W)
     - 'keyboard': (B, KB_DIM)
     - 'mouse': (B, MOUSE_DIM)
@@ -97,13 +89,13 @@ def transfusion_collate_fn(batch):
     
     # Now convert to Transfusion format
     # the output from plaicraft_collate_fn is a dict with format like (here batch B=4, number of "frames"=25, each data frame has its own shape per modality - 
-    # key_press is 2x5x16, mouse_movement is 2x10x2, audio in is 15x128, audio_out is 15x128, video is 2x4x96x160)
+    # key_press is 2x5x16, mouse_movement is 2x10x2, audio in is 15x128, audio_hear is 15x128, video is 2x4x96x160)
     # the fundamental "frame" is 2 units of each modality
     # the following is an example of the shape of the output from plaicraft_collate with B=4, num_frames=25
         # {'dict': {'action': {'dict': {'key_press': {'tensor': (4, 25, 2, 5, 16)},
         #                             'mouse_movement': {'tensor': (4, 25, 2, 10, 2)}}},
-        #         'audio_in': {'tensor': (4, 25, 15, 128)},
-        #         'audio_out': {'tensor': (4, 25, 15, 128)},
+        #         'audio_speak': {'tensor': (4, 25, 15, 128)},
+        #         'audio_hear': {'tensor': (4, 25, 15, 128)},
         #         'metadata': {'list': [{'list': [{'dict': {'end_frame': '36050',
         #                                                     'player_email': "'c57fa94e436cf49a929d0168e47d26fec3d900b321775e280ef136979c01d5a4'",
         #                                                     'player_gender': "'Male'",
@@ -186,7 +178,7 @@ def transfusion_collate_fn(batch):
         #         'valid_mask': {'tensor': (4, 25, 2, 1)},
         #         'video': {'tensor': (4, 25, 2, 4, 96, 160)}}}
         # the goal is to convert this into a datastructure compatible with Transfusion where each sample (for Transfusion) 
-        # is one "frame" of audio_out, one "frame" of video, then one "frame" of keyboard, one "frame" of mouse, one "frame" of audio_in
+        # is one "frame" of audio_hear, one "frame" of video, then one "frame" of keyboard, one "frame" of mouse, one "frame" of audio_speak
         # in transfusion speak i believe this should result in each sample having modalities like
         #     modality_default_shape=(
         #     (15,128),          # Audio In: 100 time steps
@@ -198,16 +190,16 @@ def transfusion_collate_fn(batch):
         # modality_num_dim=(2, 2, 4, 3, 3),  # Dimensionality of each modality
         # with then each sample in transfusion being structured as a list of (modality_id, data) tuples like:
         # [
-        #   (0, audio_out_frame_0),  # modality 0: audio_out
+        #   (0, audio_hear_frame_0),  # modality 0: audio_hear
         #   (1, video_frame_0),      # modality 1: video
         #   (2, keyboard_frame_0),   # modality 2: keyboard
         #   (3, mouse_frame_0),      # modality 3: mouse
-        #   (4, audio_in_frame_0),   # modality 4: audio_in
-        #   (5, audio_out_frame_1),  # modality 0: audio_out
+        #   (4, audio_speak_frame_0),   # modality 4: audio_speak
+        #   (5, audio_hear_frame_1),  # modality 0: audio_hear
         #   (6, video_frame_1),      # modality 1: video
         #   (7, keyboard_frame_1),   # modality 2: keyboard
         #   (8, mouse_frame_1),      # modality 3: mouse
-        #   (9, audio_in_frame_1),   # modality 4: audio_in
+        #   (9, audio_speak_frame_1),   # modality 4: audio_speak
         #   
         # ]
         # note that the video is really a 4 channel 96 x 160 image and should have appropriate positional embeddings applied in transfusion (handled by transfusion itself
@@ -216,8 +208,8 @@ def transfusion_collate_fn(batch):
         # ---------------------------------------------------------------------------------
         # Expected input (after Plaicraft's own collate):
         #   batch: Dict with keys
-        #     - 'audio_in':  Tensor[B, T, 15, 128]
-        #     - 'audio_out': Tensor[B, T, 15, 128]
+        #     - 'audio_speak':  Tensor[B, T, 15, 128]
+        #     - 'audio_hear': Tensor[B, T, 15, 128]
         #     - 'video':     Tensor[B, T, 2, 4, 96, 160]
         #     - 'action':    {
         #           'key_press':      Tensor[B, T, 2, 5, 16],
@@ -228,16 +220,16 @@ def transfusion_collate_fn(batch):
         # Goal output (Transfusion format):
         #   List over batch of sequences; each sequence is a List[Tuple[int, Tensor]]
         #   For each time index t in [0..T-1], we append the modalities in this order:
-        #     0: audio_out frame (shape [15, 128])
+        #     0: audio_hear frame (shape [15, 128])
         #     1: video      pair (shape [2, 4, 96, 160])
         #     2: keyboard   pair (shape [2, 5, 16])
         #     3: mouse      pair (shape [2, 10, 2])
-        #     4: audio_in   frame (shape [15, 128])
+        #     4: audio_speak   frame (shape [15, 128])
         #
         # Notes
         # - We treat the "fundamental frame" as a pair for modalities that are naturally paired
         #   in the dataset (video/key_press/mouse_movement -> leading dimension of 2) and as a
-        #   single frame for audio modalities (audio_in/out -> no leading pair dimension).
+        #   single frame for audio modalities (audio_speak/out -> no leading pair dimension).
         # - We keep raw shapes so the Transfusion model can apply axial positional embeddings
         #   for 2D/3D modalities and relative time embeddings for 1D/paired modalities.
         # - If 'valid_mask' is present and both elements in the pair are invalid for a time
@@ -247,32 +239,32 @@ def transfusion_collate_fn(batch):
         # Basic validations and shape extraction
         assert isinstance(batch, dict), "Expected a dict from Plaicraft collate_fn"
 
-        audio_in = batch.get('audio_in')
-        audio_out = batch.get('audio_out')
+        audio_speak = batch.get('audio_speak')
+        audio_hear = batch.get('audio_hear')
         video = batch.get('video')
-        action = batch.get('action', {})
+        action = batch.get('KeyAndMouse', {})
         key_press = None if action is None else action.get('key_press')
         mouse = None if action is None else action.get('mouse_movement')
         valid_mask = batch.get('valid_mask', None)
 
         # Ensure required keys are present
         required = {
-            'audio_in': audio_in,
-            'audio_out': audio_out,
+            'audio_speak': audio_speak,
+            'audio_hear': audio_hear,
             'video': video,
         }
         missing = [k for k, v in required.items() if v is None]
         assert not missing, f"Missing required modalities from collate: {missing}"
 
-        B = audio_in.shape[0]
-        T = audio_in.shape[1]
+        B = audio_speak.shape[0]
+        T = audio_speak.shape[1]
 
         # Consistency checks across modalities on B and T
         def _check_bt(tensor, name):
             assert tensor.shape[0] == B and tensor.shape[1] == T, \
-                f"{name} must share batch/time dims with audio_in: got {tuple(tensor.shape[:2])} vs {(B, T)}"
+                f"{name} must share batch/time dims with audio_speak: got {tuple(tensor.shape[:2])} vs {(B, T)}"
 
-        _check_bt(audio_out, 'audio_out')
+        _check_bt(audio_hear, 'audio_hear')
         _check_bt(video, 'video')
         if key_press is not None:
             _check_bt(key_press, 'action.key_press')
@@ -286,14 +278,14 @@ def transfusion_collate_fn(batch):
 
 
         # Causal ordering: input modalities at time t condition output modalities at time t+1
-        # Order per timestep: keyboard_{t}, mouse_{t}, audio_in_{t} -> audio_out_{t+1}, video_{t+1}
-        # This ensures that actions/audio_in at time t predict the resulting audio_out and video at t+1
+        # Order per timestep: keyboard_{t}, mouse_{t}, audio_speak_{t} -> audio_hear_{t+1}, video_{t+1}
+        # This ensures that actions/audio_speak at time t predict the resulting audio_hear and video at t+1
         # We iterate from t=0 to T-2 (using t and t+1 pairs)
         for b in range(B):
             sample_seq = []  # sequence for this sample (list of (modality_id, tensor))
             
             # Add dummy token to avoid empty text list error (will be ignored with ignore_index=-1)
-            #sample_seq.extend(torch.tensor([-1], dtype=torch.long, device=audio_in.device))
+            #sample_seq.extend(torch.tensor([-1], dtype=torch.long, device=audio_speak.device))
 
             for t in range(1, T - 1):  # Stop at T since we access t+1
                 sample_seq.append((3, key_press[b, t-1, 0].float()))   
@@ -302,21 +294,21 @@ def transfusion_collate_fn(batch):
                 sample_seq.append((3, key_press[b, t-1, 1].float()))   
                 sample_seq.append((4, mouse[b, t-1, 1].float())) 
                 sample_seq.append((2, video[b, t-1, 1].float()))
-                sample_seq.append((0, audio_in[b, t-1].float()))
-                sample_seq.append((1, audio_out[b, t-1].float()))
-                sample_seq.append((0, audio_in[b, t].float()))
+                sample_seq.append((0, audio_speak[b, t-1].float()))
+                sample_seq.append((1, audio_hear[b, t-1].float()))
+                sample_seq.append((0, audio_speak[b, t].float()))
                 sample_seq.append((4, mouse[b, t, 0].float()))
                 sample_seq.append((3, key_press[b, t, 0].float()))
                 sample_seq.append((4, mouse[b, t, 1].float()))
                 sample_seq.append((3, key_press[b, t, 1].float()))
                 sample_seq.append((2, video[b, t, 0].float())) 
                 sample_seq.append((2, video[b, t, 1].float())) 
-                sample_seq.append((1, audio_out[b, t].float()))
+                sample_seq.append((1, audio_hear[b, t].float()))
 
 
             transfusion_batch.append(sample_seq)
-        print("INSIDE TRANSFUSION COLLATE FN OUTPUT:")
-        pprint.pprint(f(transfusion_batch))
+        # print("INSIDE TRANSFUSION COLLATE FN OUTPUT:")
+        # pprint.pprint(f(transfusion_batch))
         return transfusion_batch
 
 
@@ -405,35 +397,35 @@ model = Transfusion(
         depth = DEPTH,
         dim_head = DIM_HEAD,
         heads = HEADS,
+        use_flex_attn = True,
     ),
-    
     # Modality configurations matching collate output:
-    # Modality 0: audio_in   - shape [15, 128] - 1D temporal signal
-    # Modality 1: audio_out  - shape [15, 128] - 1D temporal signal  
+    # Modality 0: audio_speak   - shape [15, 128] - 1D temporal signal
+    # Modality 1: audio_hear  - shape [15, 128] - 1D temporal signal  
     # Modality 2: video      - shape [4, 96, 160] - 2D spatial (C, H, W)
     # Modality 3: key_press  - shape [5, 16] - 2D embedding (keys, features)
     # Modality 4: mouse      - shape [10, 2] - 2D trajectory (steps, xy)
     dim_latent=(128, 128, 4, 16, 2),
     
     modality_default_shape=(
-        (15, 128),      # audio_in: 15 time steps × 128 features
-        (15, 128),      # audio_out: 15 time steps × 128 features
+        (15, 128),      # audio_speak: 15 time steps × 128 features
+        (15, 128),      # audio_hear: 15 time steps × 128 features
         (4, 96, 160),   # video: 4 channels × 96 height × 160 width
         (5, 16),        # keyboard: 5 keys × 16 embedding dims
         (10, 2),        # mouse: 10 time steps × 2 coords (x,y)
     ),
     
-    modality_num_dim=(2, 2, 3, 2, 2),  # Number of spatial/temporal dimensions per modality
+    modality_num_dim=(1, 1, 2, 1, 1),  # Number of spatial/temporal dimensions per modality
     
     # channel_first_latent: whether input is (C, ...) vs (..., C)
     # - audio: (15, 128) is (time, features) → channel-last → False
-    # - video: (4, 96, 160) is (C, H, W) → channel-first → True  
+    # - video frame(s): (4, 96, 160) is (C, H, W) → channel-first → True  
     # - keyboard/mouse: (keys, features) / (time, xy) → channel-last → False
     channel_first_latent=(False, False, True, False, False),
     
     # add_pos_emb: inject learned positional embeddings
     # - audio: temporal position embeddings helpful
-    # - video: spatial (H, W) axial embeddings
+    # - video frame(s): spatial (H, W) axial embeddings
     add_pos_emb=(True, True, True, False, False),
     
     # Training settings
@@ -471,8 +463,7 @@ while step < NUM_TRAIN_STEPS:
         
         # Forward pass
         # fixme: batch is empty here
-        loss_breakdown = model(batch)
-        loss = loss_breakdown.total
+        loss = model(batch)
         
         # Backward pass
         optimizer.zero_grad()
@@ -485,32 +476,43 @@ while step < NUM_TRAIN_STEPS:
         
         # Logging
         if divisible_by(step, 100):
-            print(f'Step {step}/{NUM_TRAIN_STEPS} | Loss: {loss.item():.4f} | Flow: {loss_breakdown.flow:.4f}')
+            print(f'Step {step}/{NUM_TRAIN_STEPS} | Loss: {loss.item():.4f} ')
         
         # Evaluation
-        if divisible_by(step, EVAL_EVERY):
-            model.eval()
-            with torch.no_grad():
-                # Sample from EMA model
-                print('\n--- Sampling from EMA model ---')
-                sample = ema_model.sample(
-                    batch_size=1,
-                    max_length=512,  # Adjust based on expected total sequence length
-                    temperature=1.0
-                )
-                print_modality_sample(sample)
-            model.train()
+        # if divisible_by(step, EVAL_EVERY):
+        #     model.eval()
+        #     with torch.no_grad():
+        #         # Sample from EMA model with conditioning from first batch sample
+        #         print('\n--- Sampling from EMA model ---')
+        #         # Use first few modalities from batch as prompt for conditional generation
+        #         if len(batch) > 0 and len(batch[0]) > 0:
+        #             # Take first 8 modalities as prompt (audio_speak, video, keyboard, mouse sequence)
+        #             prompt = batch[0][:min(8, len(batch[0]))]
+        #             sample = ema_model.sample(
+        #                 prompt=prompt,
+        #                 max_length=512,  # Adjust based on expected total sequence length
+        #                 temperature=1.0
+        #             )
+        #             print_modality_sample(sample)
+        #         else:
+        #             print("Skipping sampling - empty batch")
+        #     model.train()
         
         # Save checkpoint
         if divisible_by(step, CHECKPOINT_EVERY):
-            checkpoint = {
+            ckpt_path = CHECKPOINT_PATH / f'checkpoint_step_{step}.pt'
+            
+            # Direct save avoids debugger inspection overhead
+            torch.save({
                 'step': step,
                 'model_state_dict': model.state_dict(),
                 'ema_model_state_dict': ema_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-            }
-            torch.save(checkpoint, CHECKPOINT_PATH / f'checkpoint_step_{step}.pt')
-            print(f'Saved checkpoint at step {step}')
+            }, ckpt_path)
+            
+            # Log checkpoint info without triggering slow repr
+            ckpt_size_mb = ckpt_path.stat().st_size / 1e6 if ckpt_path.exists() else 0
+            print(f'✓ Checkpoint saved: {ckpt_path.name} ({ckpt_size_mb:.1f} MB)')
         
         step += 1
 

@@ -1307,7 +1307,7 @@ class Transfusion(Module):
 
         assert len(self.modality_num_dim) == self.num_modalities
 
-        assert all([not exists(ndim) or not exists(shape) or len(shape) == ndim for ndim, shape in zip(self.modality_num_dim, self.modality_default_shape)])
+        assert all([not exists(ndim) or not exists(shape) or len(shape)-1 == ndim for ndim, shape in zip(self.modality_num_dim, self.modality_default_shape)])
 
         # whether to add an extra axial positional embedding per modality
 
@@ -2259,8 +2259,13 @@ class Transfusion(Module):
                 if is_tensor(modality) and modality.dtype == torch.float:
                     modality = (0, modality)
 
-                if not isinstance(modality, tuple):
+                # Normalize modality format: accept both tuples and lists for multiworker dataloader compatibility
+                if not isinstance(modality, (tuple, list)):
                     continue
+
+                # Convert list to tuple for consistent handling downstream
+                if isinstance(modality, list):
+                    modality = tuple(modality)
 
                 modality_type, modality_tensor = modality
                 batch_modalities[ind] = modality
