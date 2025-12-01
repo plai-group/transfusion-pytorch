@@ -1,7 +1,7 @@
 # Transfusion-PyTorch Agent Instructions
 
 ## Overview
-This is a PyTorch implementation of Transfusion (Meta AI, 2024) - a unified multi-modal model that combines autoregressive text generation with flow matching for continuous modalities (images, audio, embeddings). The codebase substitutes diffusion with flow matching inspired by Flux.
+This is a PyTorch implementation of Transfusion - a unified multi-modal model that combines autoregressive text generation with flow matching for continuous modalities (images, audio, embeddings). The codebase substitutes diffusion with flow matching inspired by Flux.
 
 ## Core Architecture
 
@@ -146,51 +146,6 @@ Examples: `diffusers`, `datasets`, `adam-atan2-pytorch`
 
 ## Adding TODOs for AI Agents
 
-### Where to Add TODOs
-1. **In-code comments** (discoverable via `grep_search`):
-   ```python
-   # TODO: Add support for 3D modalities (videos)
-   # FIXME: Velocity consistency loss unstable with very small delta_time
-   # OPTIMIZE: Batch processing for multi-modal sequences could be more efficient
-   ```
-
-2. **GitHub Issues**: Create issues with labels like `good-first-issue`, `ai-agent-friendly`, `enhancement`
-   - Include specific file references and line numbers
-   - Provide context about expected behavior
-   - Link to related test cases
-
-3. **Project-level TODO file**: Create `TODO.md` in project root for larger initiatives:
-   ```markdown
-   ## High Priority
-   - [ ] Add video modality support (3D flow matching)
-   - [ ] Implement CFG (Classifier-Free Guidance) for conditional generation
-   
-   ## Implementation Notes
-   - Video: Extend `modality_num_dim` to support 3, update `ContinuousAxialPositionalEmbedding`
-   - CFG: Add unconditional training mode, modify sampling to blend conditional/unconditional flows
-   ```
-
-4. **Test files**: Mark incomplete test coverage:
-   ```python
-   # TODO: Add test for mixed 0D/2D modalities (embeddings + images)
-   @pytest.mark.skip(reason="Not yet implemented")
-   def test_mixed_dimensionality():
-       pass
-   ```
-
-### TODO Formatting for Best AI Discovery
-- **Be specific**: Include file paths, function names, line numbers
-- **Provide context**: Explain why, not just what
-- **Link examples**: Reference similar existing code
-- **Specify constraints**: Mention compatibility requirements, performance targets
-
-Example good TODO:
-```python
-# TODO: Extend forward_modality() (line ~1946) to support batched multi-resolution
-# Currently assumes all samples in batch have same modality shape
-# See train_mnist.py for single-resolution example
-# Challenge: Flex attention mask needs dynamic per-sample resolution handling
-```
 
 ## Resources
 - Main paper: "Transfusion: Predict the Next Token and Diffuse Images with One Multi-Modal Model" (Zhou et al. 2024)
