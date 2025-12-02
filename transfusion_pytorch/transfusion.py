@@ -1307,7 +1307,7 @@ class Transfusion(Module):
 
         assert len(self.modality_num_dim) == self.num_modalities
 
-        assert all([not exists(ndim) or not exists(shape) or len(shape)-1 == ndim for ndim, shape in zip(self.modality_num_dim, self.modality_default_shape)])
+        assert all([not exists(ndim) or not exists(shape) or len(shape) == ndim for ndim, shape in zip(self.modality_num_dim, self.modality_default_shape)])
 
         # whether to add an extra axial positional embedding per modality
 
@@ -1598,32 +1598,48 @@ class Transfusion(Module):
         if is_tensor(prompt) and prompt.dtype == torch.float: # is modality with type 0 implicit
             prompt = (0, prompt)
 
-        prompt_is_modality = isinstance(prompt, tuple)
+        # normalize prompt to list
 
-        if is_tensor(prompt) and prompt.dtype in (torch.int, torch.long): # is text only prompt
+        if prompt is None:
+            prompt = []
+        elif isinstance(prompt, tuple) or (is_tensor(prompt) and prompt.dtype in (torch.int, torch.long)):
             prompt = [prompt]
+        elif isinstance(prompt, list):
+            pass
+        else:
+            raise ValueError('prompt must be None, a tensor, a tuple, or a list')
 
-        elif prompt_is_modality:
-            modality_type, modality = prompt
+        # process prompt list to wrap modalities
 
-            mod = self.get_modality_info(modality_type)
+        processed_prompt = []
+        for item in prompt:
+            if is_tensor(item) and item.dtype == torch.float:
+                item = (0, item)
 
-            if exists(mod.encoder):
-                with torch.no_grad():
-                    mod.encoder.eval()
-                    modality = self.maybe_add_temp_batch_dim(mod.encoder)(modality).detach()
+            if isinstance(item, tuple):
+                modality_type, modality = item
+                mod = self.get_modality_info(modality_type)
 
-            modality_shape_tuple = self.get_modality_shape(modality, modality_type)
-            modality_shape_str = join([*map(str, modality_shape_tuple)], ',')
-            modality_meta_info = self.char_tokenizer(modality_shape_str, device = device)
+                if exists(mod.encoder):
+                    with torch.no_grad():
+                        mod.encoder.eval()
+                        modality = self.maybe_add_temp_batch_dim(mod.encoder)(modality).detach()
 
-            prompt = [
-                tensor([self.meta_id]),
-                modality_meta_info,
-                tensor([mod.som_id]),
-                (modality_type, modality),
-                tensor([mod.eom_id]),
-            ]
+                modality_shape_tuple = self.get_modality_shape(modality, modality_type)
+                modality_shape_str = join([*map(str, modality_shape_tuple)], ',')
+                modality_meta_info = self.char_tokenizer(modality_shape_str, device = device)
+
+                processed_prompt.extend([
+                    tensor([self.meta_id]),
+                    modality_meta_info,
+                    tensor([mod.som_id]),
+                    (modality_type, modality),
+                    tensor([mod.eom_id]),
+                ])
+            else:
+                processed_prompt.append(item)
+        
+        prompt = processed_prompt
 
         # sos
 
@@ -1631,7 +1647,7 @@ class Transfusion(Module):
 
         # just take care of prompt being zero dimensions
 
-        modality_sample = [init_text_seq, *default(prompt, [])]
+        modality_sample = [init_text_seq, *prompt]
 
         # take care of moving to device
 
@@ -1646,7 +1662,7 @@ class Transfusion(Module):
         curr_modality_id = None
         modality_shape = None
 
-        num_past_modalities = int(prompt_is_modality) # either 0 or 1 (if the prompt given is a modality)
+        num_past_modalities = sum(1 for item in prompt if isinstance(item, tuple)) # count modalities in prompt
 
         text_is_greedy = text_temperature == 0.
         is_decoding_text = True  # starts off with text decoding, and alternates with modalities depending on [som] tokens detected
