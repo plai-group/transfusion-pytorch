@@ -1299,7 +1299,7 @@ class Transfusion(Module):
 
         # default `modality_num_dim` to `len(modality_default_shape)` if latter is specified but former not
 
-        modality_num_dim = default(modality_num_dim, tuple(len(shape) for shape in self.modality_default_shape))
+        modality_num_dim = default(modality_num_dim, tuple(len(shape) if exists(shape) else None for shape in self.modality_default_shape))
 
         # specifying the number of dimensions for the modality, which will be hard validated
 

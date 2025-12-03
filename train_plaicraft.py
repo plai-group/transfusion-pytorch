@@ -408,11 +408,11 @@ model = Transfusion(
     dim_latent=(128, 128, 4, 16, 2),
     
     modality_default_shape=(
-        (15, 128),      # audio_speak: 15 time steps × 128 features
-        (15, 128),      # audio_hear: 15 time steps × 128 features
-        (4, 96, 160),   # video: 4 channels × 96 height × 160 width
-        (5, 16),        # keyboard: 5 keys × 16 embedding dims
-        (10, 2),        # mouse: 10 time steps × 2 coords (x,y)
+        (15,),          # audio_speak: 15 time steps (channel dim separate in dim_latent)
+        (15,),          # audio_hear: 15 time steps (channel dim separate in dim_latent)
+        (96, 160),      # video: 96 height × 160 width (channel dim separate in dim_latent)
+        (5,),           # keyboard: 5 keys (embedding dim separate in dim_latent)
+        (10,),          # mouse: 10 time steps (xy coords dim separate in dim_latent)
     ),
     
     modality_num_dim=(1, 1, 2, 1, 1),  # Number of spatial/temporal dimensions per modality
